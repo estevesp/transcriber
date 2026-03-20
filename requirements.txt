@@ -1,0 +1,4 @@
+numpy
+pyaudio
+mlx-whisper
+lameenc
