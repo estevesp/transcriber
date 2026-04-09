@@ -3,10 +3,12 @@ Simple Live Microphone + System Audio Transcriber — Mac Apple Silicon
 Captures mic and system audio (via BlackHole) and transcribes in real time.
 """
 
+import argparse
 import os
 import queue
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -152,7 +154,7 @@ def save_audio_mp3(audio_buffers: Dict[str, list], filepath: str) -> None:
     mixed = mixed.astype(np.int16)
 
     encoder = lameenc.Encoder()
-    encoder.set_bit_rate(128)
+    encoder.set_bit_rate(64)
     encoder.set_in_sample_rate(SAMPLE_RATE)
     encoder.set_channels(1)
     encoder.set_quality(2)
@@ -207,6 +209,44 @@ def find_blackhole(devices: List[Dict]) -> Optional[int]:
         if "blackhole" in dev["name"].lower():
             return i
     return None
+
+
+# ── Zoom Meeting Detection ────────────────────────────────────────────────────
+
+def is_zoom_meeting_active() -> bool:
+    """Detect if a Zoom meeting is currently active.
+
+    Uses two complementary signals:
+    1. UDP connections to port 8801 (Zoom media servers) — primary signal.
+    2. CptHost process — Zoom's conferencing host, only runs during meetings.
+
+    Either signal being present means the meeting is active. This avoids false
+    stops when UDP briefly drops (e.g. when starting Zoom recording).
+    """
+    # Check 1: UDP media connections to port 8801
+    try:
+        result = subprocess.run(
+            ["lsof", "-i", "UDP", "-n", "-P"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("zoom") and ":8801" in line:
+                return True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Check 2: CptHost process (stays alive even when UDP briefly drops)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "CptHost"],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    return False
 
 
 # Lock to serialize GPU access (mlx-whisper is not thread-safe)
@@ -326,34 +366,111 @@ def transcription_loop(
         stream.close()
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Transcription Session ─────────────────────────────────────────────────────
 
-def main():
-    print(f"\n{BOLD}🎤 Live Transcriber{RESET}")
-    print(f"{DIM}Model: {MODEL} · Chunk: {CHUNK_DURATION}s · Ctrl+C to stop{RESET}\n")
+def run_transcription_session(
+    pa: pyaudio.PyAudio,
+    mic_index: Optional[int],
+    sys_index: Optional[int],
+    meeting_name: str,
+    record_audio: bool,
+    running: threading.Event,
+) -> str:
+    """Run a single transcription session. Returns the log file path."""
+    os.makedirs("transcripts", exist_ok=True)
 
-    pa = pyaudio.PyAudio()
+    ts_file = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = os.path.join("transcripts", f"transcript-{ts_file} - [{meeting_name}].txt")
+
+    print(f"{DIM}Log: {log_file}{RESET}")
+    print(f"{GREEN}▶ Listening...{RESET}\n")
+
+    log = open(log_file, "a", encoding="utf-8")
+    with file_lock:
+        log.write(f"# {meeting_name}\n")
+        log.write(f"# Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        log.flush()
+        os.fsync(log.fileno())
+
+    running.set()
+    threads = []
+
+    shared_state = {}
+    audio_buffers = {}
+    if mic_index is not None:
+        shared_state["[MIC]"] = {"rms": 0.0, "color": CYAN}
+        if record_audio:
+            audio_buffers["[MIC]"] = []
+    if sys_index is not None:
+        shared_state["[SYS]"] = {"rms": 0.0, "color": YELLOW}
+        if record_audio:
+            audio_buffers["[SYS]"] = []
+
+    if mic_index is not None:
+        t = threading.Thread(
+            target=transcription_loop,
+            args=(pa, mic_index, "[MIC]", CYAN, log, running, shared_state, audio_buffers),
+            daemon=True,
+        )
+        threads.append(t)
+        t.start()
+
+    if sys_index is not None:
+        t = threading.Thread(
+            target=transcription_loop,
+            args=(pa, sys_index, "[SYS]", YELLOW, log, running, shared_state, audio_buffers),
+            daemon=True,
+        )
+        threads.append(t)
+        t.start()
+
+    try:
+        while running.is_set():
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+
+    for t in threads:
+        t.join(timeout=5)
+
+    with file_lock:
+        log.write(f"\n# Stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.flush()
+        os.fsync(log.fileno())
+        log.close()
+    print(f"\r\033[K\n{DIM}⏹ Stopped. Log saved to {log_file}{RESET}")
+
+    if record_audio:
+        audio_file = log_file.rsplit(".", 1)[0] + ".mp3"
+        print(f"{DIM}Encoding audio...{RESET}", end="", flush=True)
+        save_audio_mp3(audio_buffers, audio_file)
+        print(f"\r\033[K{DIM}⏹ Audio saved to {audio_file}{RESET}")
+
+    return log_file
+
+
+# ── Setup Helpers ─────────────────────────────────────────────────────────────
+
+def setup_devices(pa: pyaudio.PyAudio):
+    """Interactive device selection. Returns (mic_index, sys_index)."""
     devices = list_input_devices(pa)
 
     if not devices:
-        print("❌ No input devices found.")
+        print("No input devices found.")
         pa.terminate()
         sys.exit(1)
 
-    # Show device list
     print(f"{BOLD}Available input devices:{RESET}\n")
     for i, dev in enumerate(devices):
         tag = ""
         if "blackhole" in dev["name"].lower():
-            tag = f"  {DIM}← system audio{RESET}"
+            tag = f"  {DIM}<- system audio{RESET}"
         print(f"  {CYAN}[{i}]{RESET}  {dev['name']}{tag}")
     print()
 
-    # Select microphone
     print(f"{BOLD}1. Microphone{RESET} (your voice)")
     mic_index = pick_device(pa, devices, f"   Select mic device (0-{len(devices)-1}): ")
 
-    # Select system audio (BlackHole)
     print(f"\n{BOLD}2. System Audio{RESET} (Zoom/other apps via BlackHole)")
     bh_hint = find_blackhole(devices)
     if bh_hint is not None:
@@ -364,44 +481,112 @@ def main():
     sys_index = pick_device(pa, devices, f"   Select system audio device (0-{len(devices)-1}, or 's' to skip): ")
 
     if mic_index is None and sys_index is None:
-        print("❌ No devices selected. Exiting.")
+        print("No devices selected. Exiting.")
         pa.terminate()
         sys.exit(1)
 
-    # Ask about audio recording
-    print(f"\n{BOLD}3. Record Audio{RESET} (save MP3 alongside transcript)")
-    while True:
-        try:
-            rec_choice = input(f"   Record audio? (y/n) [n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print(f"\n{DIM}Cancelled.{RESET}")
-            pa.terminate()
-            sys.exit(0)
-        if rec_choice in ("y", "yes"):
-            record_audio = True
-            print(f"  {DIM}→ Audio recording enabled{RESET}")
-            break
-        elif rec_choice in ("n", "no", ""):
-            record_audio = False
-            print(f"  {DIM}→ Audio recording disabled{RESET}")
-            break
-        else:
-            print("  Please enter 'y' or 'n'.")
+    return mic_index, sys_index
 
-    # Warm up model
+
+def warmup_model():
+    """Load and warm up the Whisper model."""
     print(f"\n{DIM}Loading model...{RESET}")
     warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)
     mlx_whisper.transcribe(warmup_audio, path_or_hf_repo=MODEL)
     print(f"{GREEN}✓ Model loaded.{RESET}\n")
 
-    # Override SIGINT so Ctrl+C just stops the current meeting, not the whole app
+
+# ── Watch Mode (Auto-detect Zoom Meetings) ───────────────────────────────────
+
+WATCH_POLL_INTERVAL = 3  # seconds between Zoom detection checks
+
+def watch_loop(pa, mic_index, sys_index, record_audio):
+    """Watch for Zoom meetings and auto-start/stop transcription."""
     running = threading.Event()
+    stop_watch = threading.Event()
+
+    def on_sigint(sig, frame):
+        if running.is_set():
+            running.clear()
+        else:
+            stop_watch.set()
+
+    signal.signal(signal.SIGINT, on_sigint)
+
+    print(f"{BOLD}👀 Watching for Zoom meetings...{RESET}")
+    print(f"{DIM}Will auto-start transcription when a meeting is detected.{RESET}")
+    print(f"{DIM}Press Ctrl+C to exit.{RESET}\n")
+
+    while not stop_watch.is_set():
+        sys.stdout.write(f"\r\033[K  {DIM}Waiting for Zoom meeting...{RESET}")
+        sys.stdout.flush()
+
+        # Wait for a meeting to start
+        while not stop_watch.is_set():
+            if is_zoom_meeting_active():
+                break
+            time.sleep(WATCH_POLL_INTERVAL)
+
+        if stop_watch.is_set():
+            break
+
+        # Meeting detected — run transcription in a background thread so we
+        # can keep polling for meeting end in this thread.
+        meeting_name = f"zoom-{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+        print(f"\r\033[K\n{GREEN}✓ Zoom meeting detected!{RESET} Starting transcription...\n")
+
+        # Set running BEFORE starting the session thread to avoid a race
+        # where the main loop checks running.is_set() before the thread has
+        # had a chance to call running.set().
+        running.set()
+
+        session_thread = threading.Thread(
+            target=run_transcription_session,
+            args=(pa, mic_index, sys_index, meeting_name, record_audio, running),
+            daemon=True,
+        )
+        session_thread.start()
+
+        # Poll until the meeting ends or user hits Ctrl+C.
+        consecutive_inactive = 0
+        while running.is_set() and not stop_watch.is_set():
+            time.sleep(WATCH_POLL_INTERVAL)
+            if not is_zoom_meeting_active():
+                consecutive_inactive += 1
+                if consecutive_inactive >= 5:
+                    print(f"\r\033[K\n{YELLOW}Meeting ended.{RESET} Stopping transcription...")
+                    running.clear()
+            else:
+                consecutive_inactive = 0
+
+        session_thread.join(timeout=10)
+
+        if stop_watch.is_set():
+            break
+
+        print(f"\n{BOLD}👀 Watching for next Zoom meeting...{RESET}\n")
+
+        # Wait until meeting is confirmed inactive before watching again,
+        # to avoid immediately re-triggering on the same meeting.
+        while not stop_watch.is_set():
+            if not is_zoom_meeting_active():
+                break
+            time.sleep(WATCH_POLL_INTERVAL)
+
+    print(f"\n{DIM}Exiting watcher.{RESET}")
+
+
+# ── Manual Mode ───────────────────────────────────────────────────────────────
+
+def manual_loop(pa, mic_index, sys_index, record_audio):
+    """Original interactive mode: prompt for meeting names, Ctrl+C to stop each."""
+    running = threading.Event()
+
     def on_stop(sig, frame):
         running.clear()
-        
+
     signal.signal(signal.SIGINT, on_stop)
 
-    # ── Continuous Meeting Loop ──────────────────────────────────────────────
     while True:
         try:
             print("-" * 50)
@@ -413,82 +598,68 @@ def main():
         if not meeting_name:
             meeting_name = "untitled"
 
-        # Create transcripts directory if it doesn't exist
-        os.makedirs("transcripts", exist_ok=True)
+        print(f"{DIM}Press Ctrl+C to stop this meeting{RESET}")
+        run_transcription_session(
+            pa, mic_index, sys_index, meeting_name, record_audio, running,
+        )
 
-        ts_file = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_file = os.path.join("transcripts", f"transcript-{ts_file} - [{meeting_name}].txt")
-        
-        print(f"{DIM}Log: {log_file}{RESET}")
-        print(f"{GREEN}▶ Listening... (Press Ctrl+C to stop this meeting){RESET}\n")
 
-        # Open log file
-        log = open(log_file, "a", encoding="utf-8")
-        with file_lock:
-            log.write(f"# {meeting_name}\n")
-            log.write(f"# Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            log.flush()
-            os.fsync(log.fileno())
+# ── Main ───────────────────────────────────────────────────────────────────────
 
-        # Start transcription threads
-        running.set()
-        threads = []
+def main():
+    parser = argparse.ArgumentParser(description="Live audio transcriber")
+    parser.add_argument(
+        "--watch", action="store_true",
+        help="Auto-detect Zoom meetings and start/stop transcription",
+    )
+    parser.add_argument(
+        "--record", action="store_true",
+        help="Record audio as MP3 alongside the transcript",
+    )
+    args = parser.parse_args()
 
-        shared_state = {}
-        audio_buffers = {}
-        if mic_index is not None:
-            shared_state["[MIC]"] = {"rms": 0.0, "color": CYAN}
-            if record_audio:
-                audio_buffers["[MIC]"] = []
-        if sys_index is not None:
-            shared_state["[SYS]"] = {"rms": 0.0, "color": YELLOW}
-            if record_audio:
-                audio_buffers["[SYS]"] = []
+    print(f"\n{BOLD}🎤 Live Transcriber{RESET}")
+    mode_label = "watch mode" if args.watch else "manual mode"
+    print(f"{DIM}Model: {MODEL} · Chunk: {CHUNK_DURATION}s · {mode_label}{RESET}\n")
 
-        if mic_index is not None:
-            t = threading.Thread(
-                target=transcription_loop,
-                args=(pa, mic_index, "[MIC]", CYAN, log, running, shared_state, audio_buffers),
-                daemon=True,
-            )
-            threads.append(t)
-            t.start()
+    pa = pyaudio.PyAudio()
+    mic_index, sys_index = setup_devices(pa)
 
-        if sys_index is not None:
-            t = threading.Thread(
-                target=transcription_loop,
-                args=(pa, sys_index, "[SYS]", YELLOW, log, running, shared_state, audio_buffers),
-                daemon=True,
-            )
-            threads.append(t)
-            t.start()
-
-        try:
-            while running.is_set():
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            # We already handle SIGINT above, but keyboard interrupt might still throw here
-            # depending on when it hits. The handler clears `running`.
-            pass
-
-        # Wait for threads to finish
-        for t in threads:
-            t.join(timeout=5)
-
-        with file_lock:
-            log.write(f"\n# Stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            log.flush()
-            os.fsync(log.fileno())
-            log.close()
-        print(f"\r\033[K\n{DIM}⏹ Stopped meeting. Log saved to {log_file}{RESET}")
-
+    # In manual mode, ask about recording interactively (unless --record is set)
+    if args.watch:
+        record_audio = args.record
         if record_audio:
-            audio_file = log_file.rsplit(".", 1)[0] + ".mp3"
-            print(f"{DIM}Encoding audio...{RESET}", end="", flush=True)
-            save_audio_mp3(audio_buffers, audio_file)
-            print(f"\r\033[K{DIM}⏹ Audio saved to {audio_file}{RESET}")
+            print(f"  {DIM}→ Audio recording enabled{RESET}")
+    elif args.record:
+        record_audio = True
+        print(f"  {DIM}→ Audio recording enabled{RESET}")
+    else:
+        print(f"\n{BOLD}3. Record Audio{RESET} (save MP3 alongside transcript)")
+        while True:
+            try:
+                rec_choice = input(f"   Record audio? (y/n) [n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print(f"\n{DIM}Cancelled.{RESET}")
+                pa.terminate()
+                sys.exit(0)
+            if rec_choice in ("y", "yes"):
+                record_audio = True
+                print(f"  {DIM}→ Audio recording enabled{RESET}")
+                break
+            elif rec_choice in ("n", "no", ""):
+                record_audio = False
+                print(f"  {DIM}→ Audio recording disabled{RESET}")
+                break
+            else:
+                print("  Please enter 'y' or 'n'.")
 
-    # Exited the while loop
+    warmup_model()
+
+    if args.watch:
+        watch_loop(pa, mic_index, sys_index, record_audio)
+    else:
+        manual_loop(pa, mic_index, sys_index, record_audio)
+
     pa.terminate()
 
 
