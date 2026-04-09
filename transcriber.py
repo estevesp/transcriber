@@ -441,7 +441,10 @@ def run_transcription_session(
     print(f"\r\033[K\n{DIM}⏹ Stopped. Log saved to {log_file}{RESET}")
 
     if record_audio:
-        audio_file = log_file.rsplit(".", 1)[0] + ".mp3"
+        audio_dir = os.path.join("transcripts", "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        audio_filename = os.path.basename(log_file).rsplit(".", 1)[0] + ".mp3"
+        audio_file = os.path.join(audio_dir, audio_filename)
         print(f"{DIM}Encoding audio...{RESET}", end="", flush=True)
         save_audio_mp3(audio_buffers, audio_file)
         print(f"\r\033[K{DIM}⏹ Audio saved to {audio_file}{RESET}")
