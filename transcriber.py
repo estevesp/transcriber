@@ -4,11 +4,11 @@ Captures mic and system audio (via BlackHole) and transcribes in real time.
 """
 
 import argparse
+import ctypes
 import os
 import queue
 import re
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -211,42 +211,84 @@ def find_blackhole(devices: List[Dict]) -> Optional[int]:
     return None
 
 
-# ── Zoom Meeting Detection ────────────────────────────────────────────────────
+# ── Meeting Detection (Multi-Output Device) ──────────────────────────────────
+
+# CoreAudio constants
+_kAudioObjectSystemObject = 1
+_kAudioHardwarePropertyDevices = 0x64657623        # 'dev#'
+_kAudioObjectPropertyScopeGlobal = 0x676C6F62      # 'glob'
+_kAudioObjectPropertyElementMain = 0
+_kAudioObjectPropertyName = 0x6C6E616D             # 'lnam'
+_kAudioDevicePropertyIsRunningSomewhere = 0x676F6E65  # 'gone'
+
+class _AudioPropAddr(ctypes.Structure):
+    _fields_ = [("mSelector", ctypes.c_uint32),
+                ("mScope", ctypes.c_uint32),
+                ("mElement", ctypes.c_uint32)]
+
+_ca = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+_cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+_cf.CFStringGetCStringPtr.restype = ctypes.c_char_p
+_cf.CFStringGetCStringPtr.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+
+
+def _get_device_name(dev_id: int) -> str:
+    name_ref = ctypes.c_void_p()
+    size = ctypes.c_uint32(ctypes.sizeof(name_ref))
+    addr = _AudioPropAddr(_kAudioObjectPropertyName,
+                          _kAudioObjectPropertyScopeGlobal,
+                          _kAudioObjectPropertyElementMain)
+    _ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(addr),
+                                   0, None, ctypes.byref(size), ctypes.byref(name_ref))
+    cstr = _cf.CFStringGetCStringPtr(name_ref, 0x08000100)
+    if cstr:
+        return cstr.decode()
+    buf = ctypes.create_string_buffer(256)
+    _cf.CFStringGetCString(name_ref, buf, 256, 0x08000100)
+    return buf.value.decode()
+
+
+def _find_multi_output_device_id() -> Optional[int]:
+    """Find the CoreAudio device ID of the Multi-Output Device."""
+    addr = _AudioPropAddr(_kAudioHardwarePropertyDevices,
+                          _kAudioObjectPropertyScopeGlobal,
+                          _kAudioObjectPropertyElementMain)
+    size = ctypes.c_uint32(0)
+    _ca.AudioObjectGetPropertyDataSize(_kAudioObjectSystemObject,
+                                       ctypes.byref(addr), 0, None, ctypes.byref(size))
+    n = size.value // 4
+    devs = (ctypes.c_uint32 * n)()
+    _ca.AudioObjectGetPropertyData(_kAudioObjectSystemObject,
+                                   ctypes.byref(addr), 0, None, ctypes.byref(size), devs)
+    for d in devs:
+        if "multi-output" in _get_device_name(d).lower():
+            return d
+    return None
+
+
+# Resolve the device ID once at import time
+_MULTI_OUTPUT_DEVICE_ID = _find_multi_output_device_id()
+
 
 def is_zoom_meeting_active() -> bool:
-    """Detect if a Zoom meeting is currently active.
+    """Detect if a Zoom meeting is active by checking the Multi-Output Device.
 
-    Uses two complementary signals:
-    1. UDP connections to port 8801 (Zoom media servers) — primary signal.
-    2. CptHost process — Zoom's conferencing host, only runs during meetings.
-
-    Either signal being present means the meeting is active. This avoids false
-    stops when UDP briefly drops (e.g. when starting Zoom recording).
+    Queries CoreAudio's kAudioDevicePropertyDeviceIsRunningSomewhere property,
+    which is True when any process is streaming audio through the device.
+    Since only Zoom uses the Multi-Output Device, this reliably indicates
+    whether a meeting is in progress.
     """
-    # Check 1: UDP media connections to port 8801
-    try:
-        result = subprocess.run(
-            ["lsof", "-i", "UDP", "-n", "-P"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            if line.startswith("zoom") and ":8801" in line:
-                return True
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    # Check 2: CptHost process (stays alive even when UDP briefly drops)
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "CptHost"],
-            capture_output=True, timeout=5,
-        )
-        if result.returncode == 0:
-            return True
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    return False
+    if _MULTI_OUTPUT_DEVICE_ID is None:
+        return False
+    running = ctypes.c_uint32(0)
+    size = ctypes.c_uint32(4)
+    addr = _AudioPropAddr(_kAudioDevicePropertyIsRunningSomewhere,
+                          _kAudioObjectPropertyScopeGlobal,
+                          _kAudioObjectPropertyElementMain)
+    status = _ca.AudioObjectGetPropertyData(
+        _MULTI_OUTPUT_DEVICE_ID, ctypes.byref(addr),
+        0, None, ctypes.byref(size), ctypes.byref(running))
+    return status == 0 and running.value != 0
 
 
 # Lock to serialize GPU access (mlx-whisper is not thread-safe)
@@ -515,6 +557,16 @@ def watch_loop(pa, mic_index, sys_index, record_audio):
             stop_watch.set()
 
     signal.signal(signal.SIGINT, on_sigint)
+
+    if _MULTI_OUTPUT_DEVICE_ID is None:
+        print(f"{RED}Error: Multi-Output Device not found.{RESET}")
+        print(f"{DIM}Watch mode requires a Multi-Output Device configured in Audio MIDI Setup.{RESET}")
+        print(f"{DIM}To set it up:{RESET}")
+        print(f"{DIM}  1. Open Audio MIDI Setup (Spotlight → 'Audio MIDI Setup'){RESET}")
+        print(f"{DIM}  2. Click '+' at the bottom left → 'Create Multi-Output Device'{RESET}")
+        print(f"{DIM}  3. Check your output device and BlackHole 2ch{RESET}")
+        print(f"{DIM}  4. In Zoom audio settings, set the speaker to 'Multi-Output Device'{RESET}")
+        sys.exit(1)
 
     print(f"{BOLD}👀 Watching for Zoom meetings...{RESET}")
     print(f"{DIM}Will auto-start transcription when a meeting is detected.{RESET}")
